@@ -42,7 +42,7 @@ def _build_two_cell_anchor(col, row, r_id, next_id):
         f'<xdr:pic>'
         f'<xdr:nvPicPr><xdr:cNvPr id="{next_id}" name="FK_Converted_{next_id}"/>'
         f'<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>'
-        f'<xdr:blipFill><a:blip r:embed="rId{r_id}"/>'
+        f'<xdr:blipFill><a:blip r:embed="{r_id}"/>'
         f'<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
         f'<xdr:spPr><a:xfrm>'
         f'<a:off x="0" y="0"/><a:ext cx="857250" cy="857250"/>'
