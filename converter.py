@@ -1,88 +1,140 @@
 """
 WPS DISPIMG 图片转换核心逻辑 (ZIP/XML 层面操作)
-将 WPS 创建的包含 =@_xlfn.DISPIMG 公式的 XLSX 转换为标准嵌入图片的 XLSX。
 直接操作 ZIP 包内的 XML，保留所有原有图片和绘图。
+使用 O(n) 分割解析代替 O(n²) 正则，支持大文件。
 """
 
 import zipfile
 import re
 import os
-import shutil
-import xml.etree.ElementTree as ET
-
 
 REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 
+# 只编译小范围匹配的正则
+_RE_RID_NUM = re.compile(r'Id="rId(\d+)"')
+_RE_TARGET = re.compile(r'Target="([^"]+)"')
+_RE_ANCHOR_ID = re.compile(r'<xdr:cNvPr id="(\d+)"')
+_RE_REL_ENTRY = re.compile(r'<Relationship[^>]+/>')
+_RE_NAME_ID = re.compile(r'name="(ID_[^"]+)"')
+_RE_EMBED_RID = re.compile(r'r:embed="(rId\d+)"')
+_RE_DRAWING_NUM = re.compile(r'xl/drawings/drawing(\d+)\.xml$')
+_RE_SHEET_RELS = re.compile(r'xl/worksheets/_rels/sheet(\d+)\.xml\.rels$')
+_RE_SHEET_XML = re.compile(r'xl/worksheets/sheet(\d+)\.xml$')
+_RE_COORD = re.compile(r'<c r="([A-Z]+\d+)"')
+_RE_DISPIMG_ID = re.compile(r'_xlfn\.DISPIMG\(&quot;([^&]+)&quot;')
 
-def _col_letter_to_index(col_str):
-    """将列字母转为 0-based 索引: A->0, B->1, ..., G->6"""
+WPS_DRAWING_TPL = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"'
+    ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    '</xdr:wsDr>'
+)
+EMPTY_RELS_TPL = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<Relationships xmlns="{REL_NS}">'
+    '</Relationships>'
+)
+
+
+def _col_to_idx(s):
     idx = 0
-    for ch in col_str:
+    for ch in s:
         idx = idx * 26 + (ord(ch) - ord('A') + 1)
     return idx - 1
 
 
 def _parse_coord(coord):
-    """解析单元格坐标如 'D5' -> (col_index=3, row_index=4)，均为 0-based"""
     m = re.match(r'([A-Z]+)(\d+)', coord)
-    col = _col_letter_to_index(m.group(1))
-    row = int(m.group(2)) - 1
-    return col, row
+    return _col_to_idx(m.group(1)), int(m.group(2)) - 1
 
 
-def _build_two_cell_anchor(col, row, r_id, next_id):
-    """构建 twoCellAnchor XML 字符串"""
-    # 90px ≈ 857250 EMU, 使用一个单元格大小
+def _build_anchor(col, row, r_id, aid):
     return (
-        f'<xdr:twoCellAnchor>'
+        f'<xdr:twoCellAnchor editAs="oneCell">'
         f'<xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff>'
         f'<xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
-        f'<xdr:to><xdr:col>{col}</xdr:col><xdr:colOff>857250</xdr:colOff>'
-        f'<xdr:row>{row}</xdr:row><xdr:rowOff>857250</xdr:rowOff></xdr:to>'
+        f'<xdr:to><xdr:col>{col + 1}</xdr:col><xdr:colOff>0</xdr:colOff>'
+        f'<xdr:row>{row + 1}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
         f'<xdr:pic>'
-        f'<xdr:nvPicPr><xdr:cNvPr id="{next_id}" name="FK_Converted_{next_id}"/>'
+        f'<xdr:nvPicPr><xdr:cNvPr id="{aid}" name="FK_Converted_{aid}"/>'
         f'<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>'
         f'<xdr:blipFill><a:blip r:embed="{r_id}"/>'
         f'<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
         f'<xdr:spPr><a:xfrm>'
-        f'<a:off x="0" y="0"/><a:ext cx="857250" cy="857250"/>'
+        f'<a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/>'
         f'</a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
         f'<a:noFill/><a:ln w="9525"><a:noFill/></a:ln></xdr:spPr>'
         f'</xdr:pic><xdr:clientData/></xdr:twoCellAnchor>'
     )
 
 
-def _find_next_rid(rels_xml):
-    """在 rels XML 中找到下一个可用的 rId 编号"""
-    existing = re.findall(r'Id="rId(\d+)"', rels_xml)
-    return max(int(n) for n in existing) + 1 if existing else 1
+def _next_rid(xml):
+    ids = [int(m) for m in _RE_RID_NUM.findall(xml)]
+    return max(ids) + 1 if ids else 1
 
 
-def _find_max_anchor_id(drawing_xml):
-    """在 drawing XML 中找到最大的 cNvPr id"""
-    ids = re.findall(r'<xdr:cNvPr id="(\d+)"', drawing_xml)
-    return max(int(n) for n in ids) + 1 if ids else 1
+def _next_aid(xml):
+    ids = [int(m) for m in _RE_ANCHOR_ID.findall(xml)]
+    return max(ids) + 1 if ids else 1
 
 
-def _add_rels_entry(rels_xml, rid, target, rel_type):
-    """向 rels XML 中添加一条 Relationship"""
-    entry = (
-        f'<Relationship Id="{rid}" '
-        f'Type="{rel_type}" '
-        f'Target="{target}"/>'
-    )
-    # 在 </Relationships> 前插入
-    return rels_xml.replace('</Relationships>', f'{entry}\n</Relationships>')
+def _add_rel(xml, rid, target, rtype):
+    entry = f'<Relationship Id="{rid}" Type="{rtype}" Target="{target}"/>'
+    return xml.replace('</Relationships>', entry + '\n</Relationships>')
+
+
+def _find_rid_for_target(xml, target):
+    for m in _RE_REL_ENTRY.finditer(xml):
+        entry = m.group(0)
+        id_m = _RE_RID_NUM.search(entry)
+        t_m = _RE_TARGET.search(entry)
+        if id_m and t_m and t_m.group(1) == target:
+            return f'rId{id_m.group(1)}'
+    return None
+
+
+def _find_dispimg_cells(content, name_to_media):
+    """
+    用 O(n) split 方法找所有 DISPIMG 单元格。
+    返回 [(coord, img_name), ...] 和清理后的内容。
+    """
+    parts = content.split('</c>')
+    result = []
+    new_parts = []
+
+    for part in parts:
+        if 'DISPIMG' not in part:
+            new_parts.append(part)
+            continue
+
+        coord_m = _RE_COORD.search(part)
+        img_m = _RE_DISPIMG_ID.search(part)
+
+        if coord_m and img_m:
+            coord = coord_m.group(1)
+            img_name = img_m.group(1)
+            if img_name in name_to_media:
+                result.append((coord, img_name))
+                # 清除公式：只保留 <c r="XX" ... /> 的开头标签部分
+                tag_end = part.find('>')
+                if tag_end >= 0:
+                    attrs = part[:tag_end + 1]
+                    # 替换为自闭合标签
+                    if attrs.endswith('/>'):
+                        new_parts.append(attrs[:-1] + '/>')
+                    elif attrs.endswith('>'):
+                        new_parts.append(attrs[:-1] + '/>')
+                    else:
+                        new_parts.append(attrs + '/>')
+                    continue
+
+        new_parts.append(part)
+
+    return result, '</c>'.join(new_parts)
 
 
 def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
-    """
-    转换 WPS DISPIMG 嵌入图片为标准 Excel 嵌入图片。
-    直接操作 ZIP/XML，保留所有原有图片和绘图。
-
-    Returns:
-        (success: bool, message: str, count: int)
-    """
     def log(msg):
         if log_callback:
             log_callback(msg)
@@ -99,238 +151,179 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
     except Exception as e:
         return False, f"打开文件失败: {e}", 0
 
-    # ── 第一步：解析 WPS 图片映射 ──────────────────────────
-    if 'xl/cellimages.xml' not in z_in.namelist():
+    all_names = set(z_in.namelist())
+
+    # ── 解析 WPS 图片映射 ──
+    if 'xl/cellimages.xml' not in all_names:
         z_in.close()
-        return False, "未找到 WPS 嵌入图片容器 (cellimages.xml)", 0
+        return False, "未找到 WPS 嵌入图片容器", 0
 
-    cellimages_xml = z_in.read('xl/cellimages.xml').decode('utf-8')
-    cellimages_rels = z_in.read('xl/_rels/cellimages.xml.rels').decode('utf-8')
+    ci_xml = z_in.read('xl/cellimages.xml').decode('utf-8')
+    ci_rels = z_in.read('xl/_rels/cellimages.xml.rels').decode('utf-8')
 
-    # rId -> media path (相对 xl/)
     rid_to_media = {}
-    for m in re.finditer(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', cellimages_rels):
-        rid_to_media[m.group(1)] = m.group(2)
+    for m in _RE_REL_ENTRY.finditer(ci_rels):
+        entry = m.group(0)
+        id_m = _RE_RID_NUM.search(entry)
+        t_m = _RE_TARGET.search(entry)
+        if id_m and t_m:
+            rid_to_media[f'rId{id_m.group(1)}'] = t_m.group(1)
 
-    # image_name -> media path
     name_to_media = {}
-    for m in re.finditer(r'name="(ID_[^"]+)"', cellimages_xml):
+    for m in _RE_NAME_ID.finditer(ci_xml):
         name = m.group(1)
-        # 找该 cellImage 中最近的 r:embed
-        pos = m.end()
-        embed_m = re.search(r'r:embed="(rId\d+)"', cellimages_xml[pos:pos + 500])
-        if embed_m:
-            rid = embed_m.group(1)
-            if rid in rid_to_media:
-                name_to_media[name] = rid_to_media[rid]
+        embed_m = _RE_EMBED_RID.search(ci_xml[m.end():m.end() + 500])
+        if embed_m and embed_m.group(1) in rid_to_media:
+            name_to_media[name] = rid_to_media[embed_m.group(1)]
 
     log(f"  发现 {len(name_to_media)} 张 WPS 嵌入图片")
 
-    # ── 第二步：建立工作表与绘图文件的映射 ──────────────────
-    # sheet_file -> drawing_file (如果有)
-    sheet_to_drawing = {}
-    drawing_rels_cache = {}  # drawing_file -> rels_xml
+    # ── 已有绘图编号 ──
+    used_drawing_nums = set()
+    for name in all_names:
+        dm = _RE_DRAWING_NUM.match(name)
+        if dm:
+            used_drawing_nums.add(int(dm.group(1)))
 
-    for name in z_in.namelist():
-        if re.match(r'xl/worksheets/_rels/sheet\d+\.xml\.rels', name):
-            rels_content = z_in.read(name).decode('utf-8')
-            sheet_file = name.replace('xl/worksheets/_rels/', '').replace('.xml.rels', '.xml')
-            dm = re.search(r'Target="(\.\./drawings/drawing\d+\.xml)"', rels_content)
-            if dm:
-                drawing_path = 'xl/' + dm.group(1).replace('../', '')
-                sheet_to_drawing[sheet_file] = {
-                    'path': drawing_path,
-                    'rels_path': drawing_path.replace('xl/drawings/', 'xl/drawings/_rels/') + '.rels',
-                    'sheet_rels': name,
-                    'sheet_rels_content': rels_content,
-                }
+    def alloc_num():
+        n = 1
+        while n in used_drawing_nums:
+            n += 1
+        used_drawing_nums.add(n)
+        return n
 
-    # ── 第三步：读取所有 ZIP 条目并修改 ────────────────────
-    modified = {}  # path -> new_content (bytes)
+    # ── sheet -> drawing 映射 ──
+    sheet_drawing = {}
+    for name in all_names:
+        dm = _RE_SHEET_RELS.match(name)
+        if not dm:
+            continue
+        rels_content = z_in.read(name).decode('utf-8')
+        t_m = re.search(r'Target="(\.\./drawings/drawing\d+\.xml)"', rels_content)
+        if t_m:
+            dp = 'xl/' + t_m.group(1).replace('../', '')
+            sheet_drawing[f'sheet{dm.group(1)}.xml'] = {
+                'drawing': dp,
+                'drawing_rels': dp.replace('xl/drawings/', 'xl/drawings/_rels/') + '.xml.rels',
+                'sheet_rels': name,
+            }
+
+    # ── 处理每个工作表 ──
+    modified = {}
     total_count = 0
 
-    for sheet_name in sorted(z_in.namelist()):
-        if not re.match(r'xl/worksheets/sheet\d+\.xml', sheet_name):
+    for sheet_path in sorted(all_names):
+        sm = _RE_SHEET_XML.match(sheet_path)
+        if not sm:
             continue
 
-        content = z_in.read(sheet_name).decode('utf-8')
-        sheet_basename = os.path.basename(sheet_name)
+        content = z_in.read(sheet_path).decode('utf-8')
+        if 'DISPIMG' not in content:
+            continue
 
-        # 找到所有 DISPIMG 单元格
-        dispimg_cells = []
-        for cm in re.finditer(
-            r'<c r="([A-Z]+\d+)"([^>]*)>(.*?)</c>', content, re.DOTALL
-        ):
-            coord = cm.group(1)
-            inner = cm.group(3)
-            fm = re.search(r'_xlfn\.DISPIMG\(&quot;([^&]+)&quot;', inner)
-            if fm:
-                img_name = fm.group(1)
-                if img_name in name_to_media:
-                    dispimg_cells.append((coord, img_name))
+        sheet_base = os.path.basename(sheet_path)
+
+        # O(n) 查找并清除 DISPIMG
+        dispimg_cells, content = _find_dispimg_cells(content, name_to_media)
 
         if not dispimg_cells:
             continue
 
-        log(f"\n正在处理工作表: {sheet_basename} ({len(dispimg_cells)} 张图片)")
-
-        # ── 3a: 清除 DISPIMG 公式 ──
-        for coord, img_name in dispimg_cells:
-            # 替换整个 <c> 元素，保留标签和样式属性，去掉子元素
-            pattern = (
-                r'<c r="' + re.escape(coord) + r'"'
-                r'([^>]*)>.*?</c>'
-            )
-            replacement = f'<c r="{coord}"\\1/>'
-            content = re.sub(pattern, replacement, content)
+        log(f"\n正在处理工作表: [{sheet_base}] ({len(dispimg_cells)} 张图片)")
+        for coord, _ in dispimg_cells:
             log(f"  > 清除公式: {coord}")
 
-        modified[sheet_name] = content.encode('utf-8')
+        # ── 获取或创建绘图 ──
+        dinfo = sheet_drawing.get(sheet_base)
 
-        # ── 3b: 向绘图添加图片锚点 ──
-        drawing_info = sheet_to_drawing.get(sheet_basename)
-        if not drawing_info:
-            # 没有绘图文件，需要创建
-            # 找到下一个可用的 drawing 编号
-            existing_drawings = [n for n in z_in.namelist()
-                                 if re.match(r'xl/drawings/drawing\d+\.xml', n)]
-            next_num = max(
-                int(re.search(r'drawing(\d+)', n).group(1))
-                for n in existing_drawings
-            ) + 1 if existing_drawings else 1
+        if dinfo:
+            dp = dinfo['drawing']
+            rp = dinfo['drawing_rels']
+            srp = dinfo['sheet_rels']
+        else:
+            num = alloc_num()
+            dp = f'xl/drawings/drawing{num}.xml'
+            rp = f'xl/drawings/_rels/drawing{num}.xml.rels'
+            srp = f'xl/worksheets/_rels/{sheet_base}.rels'
 
-            drawing_path = f'xl/drawings/drawing{next_num}.xml'
-            rels_path = f'xl/drawings/_rels/drawing{next_num}.xml.rels'
-            sheet_rels = f'xl/worksheets/_rels/{os.path.basename(sheet_name)}.rels'
+            modified[dp] = WPS_DRAWING_TPL.encode('utf-8')
+            modified[rp] = EMPTY_RELS_TPL.encode('utf-8')
 
-            # 创建空绘图
-            empty_drawing = (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"'
-                ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
-                ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-                '</xdr:wsDr>'
-            )
-
-            # 创建绘图 rels
-            empty_rels = (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '</Relationships>'
-            )
-
-            # 创建或更新 sheet rels
-            if sheet_rels in z_in.namelist():
-                sheet_rels_content = z_in.read(sheet_rels).decode('utf-8')
+            if srp in all_names:
+                sr = z_in.read(srp).decode('utf-8')
             else:
-                sheet_rels_content = (
-                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                    '</Relationships>'
-                )
+                sr = EMPTY_RELS_TPL
 
-            # 找到下一个可用的 rId
-            next_rid = _find_next_rid(sheet_rels_content)
-            sheet_rels_content = _add_rels_entry(
-                sheet_rels_content,
-                f'rId{next_rid}',
-                f'../drawings/drawing{next_num}.xml',
+            sr_rid = _next_rid(sr)
+            sr = _add_rel(
+                sr, f'rId{sr_rid}',
+                f'../drawings/drawing{num}.xml',
                 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing'
             )
+            modified[srp] = sr.encode('utf-8')
 
-            # 在 sheet XML 中添加 <drawing> 引用
-            sheet_content = content if sheet_name not in modified else modified[sheet_name].decode('utf-8')
-            if '<drawing' not in sheet_content:
-                sheet_content = sheet_content.replace(
-                    '</worksheet>',
-                    f'<drawing r:id="rId{next_rid}"/></worksheet>'
-                )
-                modified[sheet_name] = sheet_content.encode('utf-8')
-
-            modified[sheet_rels] = sheet_rels_content.encode('utf-8')
-
-            drawing_info = {
-                'path': drawing_path,
-                'rels_path': rels_path,
-                'sheet_rels': sheet_rels,
-                'sheet_rels_content': sheet_rels_content,
-            }
-            modified[drawing_path] = empty_drawing.encode('utf-8')
-            modified[rels_path] = empty_rels.encode('utf-8')
-
-        # 读取绘图内容（优先用已修改的版本）
-        drawing_path = drawing_info['path']
-        rels_path = drawing_info['rels_path']
-
-        if drawing_path in modified:
-            drawing_xml = modified[drawing_path].decode('utf-8')
-        else:
-            drawing_xml = z_in.read(drawing_path).decode('utf-8')
-
-        if rels_path in modified:
-            drawing_rels = modified[rels_path].decode('utf-8')
-        elif rels_path in z_in.namelist():
-            drawing_rels = z_in.read(rels_path).decode('utf-8')
-        else:
-            drawing_rels = (
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '</Relationships>'
+            content = content.replace(
+                '</worksheet>',
+                f'<drawing r:id="rId{sr_rid}"/></worksheet>'
             )
 
-        next_rid = _find_next_rid(drawing_rels)
-        next_anchor_id = _find_max_anchor_id(drawing_xml)
+        # ── 读取/初始化绘图 XML ──
+        if dp in modified:
+            dx = modified[dp].decode('utf-8')
+        elif dp in all_names:
+            dx = z_in.read(dp).decode('utf-8')
+        else:
+            dx = WPS_DRAWING_TPL
+
+        if rp in modified:
+            dr = modified[rp].decode('utf-8')
+        elif rp in all_names:
+            dr = z_in.read(rp).decode('utf-8')
+        else:
+            dr = EMPTY_RELS_TPL
+
+        nrid = _next_rid(dr)
+        naid = _next_aid(dx)
 
         for coord, img_name in dispimg_cells:
-            media_path = name_to_media[img_name]
-            # media path 格式: "media/imageNNN.png"
-            # drawing rels 中用相对路径: "../media/imageNNN.png"
-            rel_target = f'../{media_path}'
+            media = name_to_media[img_name]
+            target = f'../{media}'
 
-            # 检查这个 media 文件是否已经在 drawing rels 中
-            existing_rid_match = re.search(
-                rf'Target="{re.escape(rel_target)}"[^>]*Id="(rId\d+)"',
-                drawing_rels
-            )
-            # 也检查 Id 在 Target 前面的情况
-            if not existing_rid_match:
-                existing_rid_match = re.search(
-                    rf'Id="(rId\d+)"[^>]*Target="{re.escape(rel_target)}"',
-                    drawing_rels
-                )
-
-            if existing_rid_match:
-                img_rid = existing_rid_match.group(1)
+            existing_rid = _find_rid_for_target(dr, target)
+            if existing_rid:
+                img_rid = existing_rid
             else:
-                img_rid = f'rId{next_rid}'
-                drawing_rels = _add_rels_entry(
-                    drawing_rels, img_rid, rel_target,
+                img_rid = f'rId{nrid}'
+                dr = _add_rel(
+                    dr, img_rid, target,
                     'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
                 )
-                next_rid += 1
+                nrid += 1
 
             col, row = _parse_coord(coord)
-            anchor_xml = _build_two_cell_anchor(col, row, img_rid, next_anchor_id)
-            next_anchor_id += 1
-
-            # 在 </xdr:wsDr> 前插入
-            drawing_xml = drawing_xml.replace('</xdr:wsDr>', f'{anchor_xml}\n</xdr:wsDr>')
+            dx = dx.replace(
+                '</xdr:wsDr>',
+                _build_anchor(col, row, img_rid, naid) + '\n</xdr:wsDr>'
+            )
+            naid += 1
             total_count += 1
-            log(f"  > 插入图片: {coord} <- {media_path}")
+            log(f"  > 插入图片: {coord} <- {media}")
 
-        modified[drawing_path] = drawing_xml.encode('utf-8')
-        modified[rels_path] = drawing_rels.encode('utf-8')
+        modified[sheet_path] = content.encode('utf-8')
+        modified[dp] = dx.encode('utf-8')
+        modified[rp] = dr.encode('utf-8')
 
-    # ── 第四步：写入输出 ZIP ─────────────────────────────
+    # ── 写入输出 ZIP ──
     log(f"\n正在保存到: {output_xlsx} ...")
 
     try:
         with zipfile.ZipFile(output_xlsx, 'w', zipfile.ZIP_DEFLATED) as z_out:
             for item in z_in.infolist():
-                if item.filename in modified:
-                    z_out.writestr(item, modified[item.filename])
-                else:
-                    z_out.writestr(item, z_in.read(item.filename))
+                data = modified.get(item.filename)
+                z_out.writestr(item, data if data is not None else z_in.read(item.filename))
+            for path, data in modified.items():
+                if path not in all_names:
+                    z_out.writestr(path, data)
     except Exception as e:
         z_in.close()
         return False, f"保存文件失败: {e}", total_count
