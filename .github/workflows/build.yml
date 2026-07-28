@@ -24,7 +24,7 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 --hidden-import openpyxl --hidden-import Pillow --hidden-import PIL gui.py
+          pyinstaller --noconfirm --onefile --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 gui.py
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
@@ -47,7 +47,7 @@ jobs:
 
       - name: Build app
         run: |
-          pyinstaller --noconfirm --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 --hidden-import openpyxl --hidden-import Pillow --hidden-import PIL gui.py
+          pyinstaller --noconfirm --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 gui.py
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4
