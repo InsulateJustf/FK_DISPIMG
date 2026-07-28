@@ -1,0 +1,56 @@
+name: Build GUI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 --hidden-import openpyxl gui.py
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FK_DISPIMG-Windows
+          path: dist/FK_DISPIMG.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build app
+        run: |
+          pyinstaller --noconfirm --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 --hidden-import openpyxl gui.py
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FK_DISPIMG-macOS
+          path: dist/FK_DISPIMG.app
