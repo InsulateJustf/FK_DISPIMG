@@ -5,8 +5,5 @@ dist/
 *.spec
 temp_wps_images/
 *.egg-info/
-1.xlsx
-1_backup.xlsx
-1_converted.xlsx
-1.xlsx
-2.xlsx
+*.xlsx
+

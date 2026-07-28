@@ -1,7 +1,6 @@
 """
 WPS DISPIMG 图片转换核心逻辑 (ZIP/XML 层面操作)
 直接操作 ZIP 包内的 XML，保留所有原有图片和绘图。
-使用 O(n) 分割解析代替 O(n²) 正则，支持大文件。
 """
 
 import zipfile
@@ -9,8 +8,8 @@ import re
 import os
 
 REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
 
-# 只编译小范围匹配的正则
 _RE_RID_NUM = re.compile(r'Id="rId(\d+)"')
 _RE_TARGET = re.compile(r'Target="([^"]+)"')
 _RE_ANCHOR_ID = re.compile(r'<xdr:cNvPr id="(\d+)"')
@@ -20,8 +19,6 @@ _RE_EMBED_RID = re.compile(r'r:embed="(rId\d+)"')
 _RE_DRAWING_NUM = re.compile(r'xl/drawings/drawing(\d+)\.xml$')
 _RE_SHEET_RELS = re.compile(r'xl/worksheets/_rels/sheet(\d+)\.xml\.rels$')
 _RE_SHEET_XML = re.compile(r'xl/worksheets/sheet(\d+)\.xml$')
-_RE_COORD = re.compile(r'<c r="([A-Z]+\d+)"')
-_RE_DISPIMG_ID = re.compile(r'_xlfn\.DISPIMG\(&quot;([^&]+)&quot;')
 
 WPS_DRAWING_TPL = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -35,6 +32,7 @@ EMPTY_RELS_TPL = (
     f'<Relationships xmlns="{REL_NS}">'
     '</Relationships>'
 )
+DRAWING_CT = 'application/vnd.openxmlformats-officedocument.drawing+xml'
 
 
 def _col_to_idx(s):
@@ -94,44 +92,56 @@ def _find_rid_for_target(xml, target):
     return None
 
 
-def _find_dispimg_cells(content, name_to_media):
+def _find_and_clear_dispimg(content, name_to_media):
     """
-    用 O(n) split 方法找所有 DISPIMG 单元格。
-    返回 [(coord, img_name), ...] 和清理后的内容。
+    找所有 DISPIMG 单元格并清除公式，返回 (cells, new_content)。
+    用逐字符扫描代替 split，确保 XML 结构完整。
     """
-    parts = content.split('</c>')
     result = []
-    new_parts = []
+    output = []
+    i = 0
+    n = len(content)
 
-    for part in parts:
-        if 'DISPIMG' not in part:
-            new_parts.append(part)
-            continue
+    while i < n:
+        # 找 <c 标签开头
+        c_start = content.find('<c ', i)
+        if c_start == -1:
+            output.append(content[i:])
+            break
 
-        coord_m = _RE_COORD.search(part)
-        img_m = _RE_DISPIMG_ID.search(part)
+        # 写入 <c 之前的内容
+        output.append(content[i:c_start])
 
-        if coord_m and img_m:
-            coord = coord_m.group(1)
-            img_name = img_m.group(1)
-            if img_name in name_to_media:
-                result.append((coord, img_name))
-                # 清除公式：只保留 <c r="XX" ... /> 的开头标签部分
-                tag_end = part.find('>')
-                if tag_end >= 0:
-                    attrs = part[:tag_end + 1]
-                    # 替换为自闭合标签
-                    if attrs.endswith('/>'):
-                        new_parts.append(attrs[:-1] + '/>')
-                    elif attrs.endswith('>'):
-                        new_parts.append(attrs[:-1] + '/>')
-                    else:
-                        new_parts.append(attrs + '/>')
+        # 找这个 <c> 的结束标签 </c>
+        c_end = content.find('</c>', c_start)
+        if c_end == -1:
+            # 没有闭合标签，直接写入剩余内容
+            output.append(content[c_start:])
+            break
+
+        cell_full = content[c_start:c_end + 4]  # 包含 </c>
+
+        # 检查是否包含 DISPIMG
+        if 'DISPIMG' in cell_full:
+            coord_m = re.search(r'<c r="([A-Z]+\d+)"', cell_full)
+            img_m = re.search(r'_xlfn\.DISPIMG\(&quot;([^&]+)&quot;', cell_full)
+            if coord_m and img_m:
+                coord = coord_m.group(1)
+                img_name = img_m.group(1)
+                if img_name in name_to_media:
+                    result.append((coord, img_name))
+                    # 提取 <c r="XX" attrs> 的开头标签，转为自闭合
+                    tag_end = cell_full.find('>')
+                    open_tag = cell_full[:tag_end]
+                    output.append(open_tag + '/>')
+                    i = c_end + 4
                     continue
 
-        new_parts.append(part)
+        # 非 DISPIMG 单元格，原样写入
+        output.append(cell_full)
+        i = c_end + 4
 
-    return result, '</c>'.join(new_parts)
+    return result, ''.join(output)
 
 
 def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
@@ -153,7 +163,6 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
 
     all_names = set(z_in.namelist())
 
-    # ── 解析 WPS 图片映射 ──
     if 'xl/cellimages.xml' not in all_names:
         z_in.close()
         return False, "未找到 WPS 嵌入图片容器", 0
@@ -178,7 +187,6 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
 
     log(f"  发现 {len(name_to_media)} 张 WPS 嵌入图片")
 
-    # ── 已有绘图编号 ──
     used_drawing_nums = set()
     for name in all_names:
         dm = _RE_DRAWING_NUM.match(name)
@@ -192,7 +200,6 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
         used_drawing_nums.add(n)
         return n
 
-    # ── sheet -> drawing 映射 ──
     sheet_drawing = {}
     for name in all_names:
         dm = _RE_SHEET_RELS.match(name)
@@ -208,8 +215,8 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
                 'sheet_rels': name,
             }
 
-    # ── 处理每个工作表 ──
     modified = {}
+    new_drawings = []
     total_count = 0
 
     for sheet_path in sorted(all_names):
@@ -223,9 +230,7 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
 
         sheet_base = os.path.basename(sheet_path)
 
-        # O(n) 查找并清除 DISPIMG
-        dispimg_cells, content = _find_dispimg_cells(content, name_to_media)
-
+        dispimg_cells, content = _find_and_clear_dispimg(content, name_to_media)
         if not dispimg_cells:
             continue
 
@@ -233,7 +238,6 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
         for coord, _ in dispimg_cells:
             log(f"  > 清除公式: {coord}")
 
-        # ── 获取或创建绘图 ──
         dinfo = sheet_drawing.get(sheet_base)
 
         if dinfo:
@@ -248,6 +252,7 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
 
             modified[dp] = WPS_DRAWING_TPL.encode('utf-8')
             modified[rp] = EMPTY_RELS_TPL.encode('utf-8')
+            new_drawings.append(dp)
 
             if srp in all_names:
                 sr = z_in.read(srp).decode('utf-8')
@@ -267,7 +272,6 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
                 f'<drawing r:id="rId{sr_rid}"/></worksheet>'
             )
 
-        # ── 读取/初始化绘图 XML ──
         if dp in modified:
             dx = modified[dp].decode('utf-8')
         elif dp in all_names:
@@ -313,7 +317,16 @@ def wps_image_converter(input_xlsx, output_xlsx, log_callback=None):
         modified[dp] = dx.encode('utf-8')
         modified[rp] = dr.encode('utf-8')
 
-    # ── 写入输出 ZIP ──
+    if new_drawings:
+        ct_path = '[Content_Types].xml'
+        ct_xml = z_in.read(ct_path).decode('utf-8')
+        for drawing_path in new_drawings:
+            part_name = '/' + drawing_path
+            if part_name not in ct_xml:
+                override = f'<Override PartName="{part_name}" ContentType="{DRAWING_CT}"/>'
+                ct_xml = ct_xml.replace('</Types>', override + '\n</Types>')
+        modified[ct_path] = ct_xml.encode('utf-8')
+
     log(f"\n正在保存到: {output_xlsx} ...")
 
     try:
