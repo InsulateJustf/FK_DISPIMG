@@ -6,4 +6,5 @@ dist/
 temp_wps_images/
 *.egg-info/
 *.xlsx
-
+*.xls
+.DS_STORE
