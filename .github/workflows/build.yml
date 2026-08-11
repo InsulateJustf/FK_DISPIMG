@@ -29,14 +29,14 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 gui.py
 
       - name: Upload exe artifact
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v4
         with:
           name: FK_DISPIMG-Windows
           path: dist/FK_DISPIMG.exe
 
       - name: Upload exe to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v1
         with:
           files: dist/FK_DISPIMG.exe
@@ -62,14 +62,14 @@ jobs:
           pyinstaller --noconfirm --windowed --name FK_DISPIMG --hidden-import converter --hidden-import tkinterdnd2 gui.py
 
       - name: Upload app artifact
-        if: github.event_name != 'release'
+        if: github.event_name != 'release' && !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-artifact@v4
         with:
           name: FK_DISPIMG-macOS
           path: dist/FK_DISPIMG.app
 
       - name: Upload app to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v1
         with:
           files: dist/FK_DISPIMG.app
